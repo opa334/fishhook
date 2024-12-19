@@ -23,6 +23,7 @@
 
 #include "fishhook.h"
 
+#include <stdio.h>
 #include <dlfcn.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -35,6 +36,10 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -53,6 +58,8 @@ typedef struct nlist nlist_t;
 #ifndef SEG_DATA_CONST
 #define SEG_DATA_CONST  "__DATA_CONST"
 #endif
+
+#define SEG_AUTH_CONST "__AUTH_CONST"
 
 struct rebindings_entry {
   struct rebinding *rebindings;
@@ -117,6 +124,11 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            nlist_t *symtab,
                                            char *strtab,
                                            uint32_t *indirect_symtab) {
+#if __has_feature(ptrauth_calls)
+  bool section_needs_auth = !strcmp(section->sectname, "__auth_got");
+#else
+  bool section_needs_auth = false;
+#endif
   uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
 
@@ -135,8 +147,14 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
         if (symbol_name_longer_than_1 && strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
           kern_return_t err;
 
-          if (cur->rebindings[j].replaced != NULL && indirect_symbol_bindings[i] != cur->rebindings[j].replacement)
-            *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
+          if (cur->rebindings[j].replaced != NULL && indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
+            if (section_needs_auth) {
+              *(cur->rebindings[j].replaced) = ptrauth_auth_and_resign(indirect_symbol_bindings[i], ptrauth_key_process_independent_code, &indirect_symbol_bindings[i], ptrauth_key_function_pointer, 0);
+            }
+            else {
+              *(cur->rebindings[j].replaced) = ptrauth_sign_unauthenticated(indirect_symbol_bindings[i], ptrauth_key_function_pointer, 0);
+            }
+          }
 
           /**
            * 1. Moved the vm protection modifying codes to here to reduce the
@@ -153,7 +171,12 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
              * iOS 15 has corrected the const segments prot.
              * -- Lionfore Hao Jun 11th, 2021
              **/
-            indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
+            if (section_needs_auth) {
+              indirect_symbol_bindings[i] = ptrauth_auth_and_resign(cur->rebindings[j].replacement, ptrauth_key_function_pointer, 0, ptrauth_key_process_independent_code, &indirect_symbol_bindings[i]);
+            }
+            else {
+              indirect_symbol_bindings[i] = ptrauth_strip(cur->rebindings[j].replacement, ptrauth_key_function_pointer);
+            }
           }
           goto symbol_loop;
         }
@@ -209,7 +232,8 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
     cur_seg_cmd = (segment_command_t *)cur;
     if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
       if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
-          strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0) {
+          strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0 &&
+          strcmp(cur_seg_cmd->segname, SEG_AUTH_CONST) != 0) {
         continue;
       }
       for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
